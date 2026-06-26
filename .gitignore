@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+/llm_debug_responses
+/.idea
+/vault
