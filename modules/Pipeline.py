@@ -1,6 +1,5 @@
 import logging
 from datetime import datetime
-from pathlib import Path
 from typing import Optional
 from tqdm import tqdm
 
@@ -36,11 +35,12 @@ class Pipeline:
         logger.info(f"Chunk size: {chunk_size} chars")
 
     def run(self):
-        print("┌────────────────────────────────────────┐")
-        print("│                                        │")
-        print("│    Multi-Personality Graph Builder     │")
-        print("│                                        │")
-        print("└────────────────────────────────────────┘")
+        print()
+        print("==================================================")
+        print("│    TELEGRAM CHAT DOSSIER                       │")
+        print("│    Phase 1: Chunk Extraction                   │")
+        print("==================================================")
+        print()
 
         messages = self.parser.parse()
         if not messages:
@@ -63,7 +63,6 @@ class Pipeline:
         for i, chunk in enumerate(tqdm(chunks, desc="Processing chunks", initial=completed, total=len(chunks)+completed)):
             chunk_id = completed + i
             try:
-                # ПРАВИЛЬНО: extract_from_chunk возвращает dict, передаём его напрямую
                 llm_result = self.llm.extract_from_chunk(chunk['text'], {
                     'date_from': chunk['date_from'],
                     'date_to': chunk['date_to'],
@@ -81,13 +80,5 @@ class Pipeline:
                 builder.conn.commit()
 
         builder.print_stats()
-        logger.info("Generating Obsidian vault...")
-        builder.generate_obsidian_vault()
+        logger.info("Phase 1 complete. Raw data saved to database.")
         builder.close()
-
-        print("┌────────────────────────────────────────┐")
-        print("│ DONE!                                  │")
-        print("└────────────────────────────────────────┘")
-
-        print(f"Vault: {Path(self.output_dir) / 'obsidian_vault'}")
-        print(f"Database: {Path(self.output_dir) / 'personality_graph.db'}")

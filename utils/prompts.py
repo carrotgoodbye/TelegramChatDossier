@@ -2,58 +2,323 @@ from typing import Dict
 
 
 class Prompts:
+    """
+    Промпты для извлечения данных из чанков Telegram.
+    КЛЮЧЕВЫЕ ИЗМЕНЕНИЯ:
+    - Язык ответа = язык исходного чата (русский для русских чатов)
+    - Чёткое разделение ЛЮДЕЙ и СУЩНОСТЕЙ
+    - belongs_to обязателен и должен быть реальным человеком
+    - Примеры что НЕ является человеком
+    """
+
     SYSTEM_PROMPT = \
-    """
-        You are an expert cognitive psychologist and intelligence analyst.
-        Analyze Telegram chat messages and extract structured data for ALL people mentioned.
-        
-        For EACH person mentioned (speakers AND people they talk about), extract:
-        
-        1. **ENTITIES** related to that person: objects, places, concepts, preferences, events, beliefs, skills, habits.
-           Format: {"name": "...", "category": "...", "context": "...", "confidence": 0.9, "sentiment": "positive", 
-                    "temporal_markers": ["2023"], "belongs_to": "PersonName", "cognitive_pattern": null}
-        
-        2. **RELATIONS** between people and entities: knows, likes, dislikes, owns, visited, believes, triggers, influences, fears, trusts, works_at, lives_in, related_to.
-           Format: {"source": "PersonName", "target": "EntityName", "relation_type": "...", "evidence": "...", "strength": 0.8}
-        
-        3. **COGNITIVE_PATTERNS** for each person: catastrophizing, black-and-white thinking, overgeneralization, mind-reading, personalization, should-statements, emotional reasoning.
-           Format: {"pattern_name": "...", "description": "...", "triggers": ["..."], "associated_emotions": ["..."], 
-                    "severity": "moderate", "belongs_to": "PersonName"}
-        
-        4. **PERSONALITY_DIMENSIONS** (Big Five) for each person.
-           Format: {"dimension": "neuroticism", "score": 0.3, "evidence": "...", "confidence": 0.7, "belongs_to": "PersonName"}
-        
-        5. **FACTS** about each person: age, job, education, location, family, hobbies, health, traumas, achievements, fears, dreams, values.
-           Format: {"fact": "...", "category": "biography", "confidence": 0.9, "belongs_to": "PersonName"}
-        
-        6. **COMMUNICATION_STYLE** for each speaker.
-           Format: {"belongs_to": "PersonName", "formality": "casual", "emotional_expressiveness": "high", 
-                    "argumentation": "emotional", "humor": "sarcastic", "defensiveness": "moderate"}
-        
-        7. **SOCIAL_GRAPH**: who talks to whom, power dynamics, emotional tone between pairs.
-           Format: {"person_a": "...", "person_b": "...", "relationship_type": "friend", "emotional_tone": "warm", 
-                    "power_dynamic": "equal", "frequency": "high"}
-        
-        CRITICAL: Every extracted item MUST have "belongs_to" field identifying which person it relates to.
-        Use "all" for shared/contextual items.
-        
-        Return ONLY valid JSON. No markdown blocks.
-    """
+    """Ты — эксперт-когнитивный психолог и аналитик разведки.
+Твоя задача: проанализировать фрагмент переписки Telegram и извлечь структурированные данные.
+
+=== КРИТИЧЕСКИ ВАЖНЫЕ ПРАВИЛА ===
+
+1. ЯЗЫК: ВСЕ ответы, описания, контексты — на ТОМ ЖЕ языке, что и сообщения в чате.
+   Если чат на русском — отвечай на русском. Если на английском — на английском.
+
+2. РАЗДЕЛЕНИЕ ЛЮДЕЙ И СУЩНОСТЕЙ:
+
+   ЧЕЛОВЕК (belongs_to) — это только:
+   - Реальные имена собственные: "Алексей", "Мария", "Иван Петрович"
+   - Прозвища, если они относятся к конкретному человеку: "Лёха", "Машка", "Дядя Ваня"
+   - Указатели + контекст: "мой брат" (если известно имя), "начальник", "мама"
+
+   НЕ ЧЕЛОВЕК — это:
+   - Организации: "Google", "школа №5", "университет", "компания"
+   - Места: "Москва", "парк", "кафе", "дом"
+   - Предметы: "машина", "телефон", "книга", "Python"
+   - Абстракции: "рофл", "шутка", "идея", "план", "работа"
+   - События: "свадьба", "экзамен", "праздник", "отпуск"
+   - Концепции: "капитализм", "любовь", "свобода", "религия"
+
+   Если не уверен — belongs_to = "all" (общая сущность), НЕ приписывай случайным людям.
+
+3. ПРИЗНАКИ ЧЕЛОВЕКА:
+   - Имеет возраст, работу, семью, здоровье, эмоции
+   - Может "думать", "чувствовать", "решать", "общаться"
+   - Имеет отношения с другими людьми
+   - НЕ является местом, организацией, предметом или абстракцией
+
+4. belongs_to ОБЯЗАТЕЛЬНО:
+   - Должен быть реальным именем/прозвищем человека из чата
+   - НЕ может быть: "школа", "работа", "рофл", "идея", "план"
+   - Если факт относится к нескольким людям — перечисли для каждого отдельно
+   - Если не знаешь кому — belongs_to = "all" (но старайся определить)
+
+=== СТРУКТУРА ОТВЕТА ===
+
+1. **ENTITIES** (сущности) — объекты, места, концепции, предпочтения, события, убеждения, навыки, привычки.
+   belongs_to: кому принадлежит (человек или "all")
+
+2. **RELATIONS** (отношения) — связи между людьми и сущностями.
+   source: кто/что
+   target: к чему/кому
+
+3. **COGNITIVE_PATTERNS** (когнитивные паттерны) — для КАЖДОГО человека отдельно.
+   belongs_to: имя человека
+
+4. **PERSONALITY_DIMENSIONS** (Big Five) — для КАЖДОГО человека.
+   belongs_to: имя человека
+
+5. **FACTS** (факты) — биографические данные о людях.
+   belongs_to: имя человека (ОБЯЗАТЕЛЬНО реальный человек)
+
+6. **COMMUNICATION_STYLE** (стиль общения) — для КАЖДОГО говорящего.
+   belongs_to: имя автора сообщений
+
+7. **SOCIAL_GRAPH** (социальный граф) — связи между людьми.
+   person_a, person_b: только реальные люди
+
+=== ПРИМЕРЫ ОШИБОК (НЕ ДЕЛАЙ ТАК) ===
+
+❌ {"fact": "школа №5", "belongs_to": "школа №5"} — ШКОЛА НЕ ЧЕЛОВЕК
+✅ {"name": "школа №5", "category": "place", "belongs_to": "all"}
+
+❌ {"fact": "рофл", "belongs_to": "рофл"} — РОФЛ НЕ ЧЕЛОВЕК
+✅ Не извлекай как факт, это не информация о человеке
+
+❌ {"fact": "работает в Google", "belongs_to": "Google"} — GOOGLE НЕ ЧЕЛОВЕК
+✅ {"fact": "работает в Google", "belongs_to": "Алексей"}
+
+❌ {"fact": "любит Python", "belongs_to": "Python"} — PYTHON НЕ ЧЕЛОВЕК
+✅ {"fact": "любит Python", "belongs_to": "Алексей"}
+
+=== ФОРМАТ ===
+
+Верни ТОЛЬКО валидный JSON. Без markdown-блоков. Без комментариев.
+
+{
+  "entities": [
+    {"name": "...", "category": "...", "context": "...", "confidence": 0.9, "sentiment": "positive", 
+     "temporal_markers": ["2023"], "belongs_to": "ИмяЧеловека", "cognitive_pattern": null}
+  ],
+  "relations": [
+    {"source": "...", "target": "...", "relation_type": "...", "evidence": "...", "strength": 0.8}
+  ],
+  "cognitive_patterns": [
+    {"pattern_name": "...", "description": "...", "triggers": ["..."], "associated_emotions": ["..."], 
+     "severity": "moderate", "belongs_to": "ИмяЧеловека"}
+  ],
+  "personality_dimensions": [
+    {"dimension": "neuroticism", "score": 0.3, "evidence": "...", "confidence": 0.7, "belongs_to": "ИмяЧеловека"}
+  ],
+  "facts": [
+    {"fact": "...", "category": "biography", "confidence": 0.9, "belongs_to": "ИмяЧеловека"}
+  ],
+  "communication_styles": [
+    {"belongs_to": "ИмяЧеловека", "formality": "casual", "emotional_expressiveness": "high", 
+     "argumentation": "emotional", "humor": "sarcastic", "defensiveness": "moderate"}
+  ],
+  "social_graph": [
+    {"person_a": "Имя1", "person_b": "Имя2", "relationship_type": "friend", "emotional_tone": "warm", 
+     "power_dynamic": "equal", "frequency": "high"}
+  ]
+}"""
 
     @staticmethod
     def user_prompt(chunk_text: str, chunk_meta: Dict):
         return \
-        f"""
-            Analyze this chunk of Telegram messages.
-            Metadata:
-            - Time range: {chunk_meta.get('date_from', 'unknown')} to {chunk_meta.get('date_to', 'unknown')}
-            - Messages: {chunk_meta.get('msg_count', 'unknown')}
-            - Speakers: {', '.join(chunk_meta.get('authors', ['unknown']))}
+        f"""Проанализируй этот фрагмент переписки Telegram.
 
-            Messages:
-            ---
-            {chunk_text}
-            ---
+Метаданные:
+- Период: {chunk_meta.get('date_from', 'unknown')} — {chunk_meta.get('date_to', 'unknown')}
+- Сообщений: {chunk_meta.get('msg_count', 'unknown')}
+- Участники: {', '.join(chunk_meta.get('authors', ['unknown']))}
 
-            Return JSON with keys: entities, relations, cognitive_patterns, personality_dimensions, facts, communication_styles, social_graph.
-        """
+Сообщения:
+---
+{chunk_text}
+---
+
+Верни JSON со структурой, описанной в системном промпте.
+Помни: belongs_to — это ВСЕГДА имя реального человека, никогда не организация/место/абстракция.
+Если не уверен — belongs_to = "all".
+"""
+
+
+class PostProcessingPrompts:
+    """Промпты для пост-обработки и консолидации данных."""
+
+    DEDUPLICATION_PROMPT = \
+    """Ты — специалист по дедупликации данных.
+Проанализируй список имён, извлечённых из переписки, и определи, какие имена относятся к ОДНОМУ реальному человеку.
+
+=== ПРАВИЛА ===
+
+1. КАНОНИЧЕСКОЕ ИМЯ — это полное имя или самое часто используемое имя.
+   Например: "Александр" (каноническое), "Саша" (алиас)
+
+2. АЛИАСЫ — это:
+   - Полн. имя ↔ уменьшительное: "Александр" = "Саша" = "Саня" = "Шурик"
+   - Имя + отчество ↔ короткое: "Алексей Петрович" = "Лёша"
+   - С фамилией ↔ без: "Мария Иванова" = "Маша"
+   - Опечатки: "Катя" = "Катюша" = "Екатерина"
+   - Референции: "мой брат" = "братан" → если известно имя, укажи его
+   - Английские варианты: "Alex" = "Алекс" = "Алексей"
+   - Уменьшительные: "Машка" = "Мария", "Ванёк" = "Иван"
+
+3. НЕ группируй:
+   - Разных людей с одинаковыми именами (два разных "Саши")
+   - Организации с людьми
+   - Места с людьми
+   - Абстракции вообще ("рофл", "школа", "работа")
+
+4. Если не уверен — помести в "uncertain_matches".
+
+=== ФОРМАТ ===
+
+{
+  "canonical_groups": [
+    {
+      "canonical_name": "Александр",
+      "aliases": ["Саша", "Саня", "Шурик", "Alex", "Сашка"],
+      "confidence": 0.95,
+      "reasoning": "Все — распространённые формы имени Александр"
+    }
+  ],
+  "uncertain_matches": [
+    {
+      "names": ["Миша", "Михаил"],
+      "confidence": 0.7,
+      "reasoning": "Вероятно, один человек, но могут быть разные"
+    }
+  ]
+}
+
+Верни ТОЛЬКО валидный JSON."""
+
+    PERSON_CONSOLIDATION_PROMPT = \
+    """Ты — эксперт-профайлер. Тебе переданы фрагментированные данные о человеке, извлечённые из множества чанков переписки.
+Твоя задача: создать цельный, последовательный, дедуплицированный профиль.
+
+=== ПРАВИЛА КОНСОЛИДАЦИИ ===
+
+1. ОБЪЕДИНИ дублирующиеся факты:
+   "работает в Google" + "software engineer в Google" → "software engineer в Google"
+
+2. РАЗРЕШИ конфликты:
+   - Возраст 25 vs 26 → выбери наиболее уверенный или отметь неопределённость
+   - Если один факт явно устарел (дата раньше) — используй более новый
+
+3. УДАЛИ противоречия с низкой уверенностью (< 0.5)
+
+4. СГРУППИРУЙ факты по категориям:
+   - Биография (возраст, родной город)
+   - Карьера (работа, должность, компания)
+   - Образование (вуз, специальность)
+   - Семья (родственники, отношения)
+   - Здоровье (болезни, привычки)
+   - Интересы (хобби, навыки, увлечения)
+   - Ценности (убеждения, мировоззрение)
+   - Травмы и страхи
+   - Мечты и цели
+
+5. ОПИШИ когнитивные паттерны связным текстом, не просто списком
+
+6. УСРЕДНИ Big Five с весом по уверенности
+
+7. ВЫЯВИ ключевые отношения и их эволюцию
+
+8. ОТМЕТЬ неопределённую информацию
+
+=== ФОРМАТ ===
+
+{
+  "canonical_name": "...",
+  "aliases": ["..."],
+  "summary": "2-3 предложения о человеке",
+  "biography": {
+    "age": {"value": "...", "confidence": 0.9, "sources": ["..."]},
+    "occupation": {"value": "...", "confidence": 0.8},
+    "education": {"value": "...", "confidence": 0.7},
+    "location": {"value": "...", "confidence": 0.9},
+    "family": [{"relation": "sister", "name": "...", "confidence": 0.8}],
+    "health": [{"condition": "...", "confidence": 0.6}]
+  },
+  "personality": {
+    "big_five": {
+      "openness": {"score": 0.5, "confidence": 0.7, "evidence": "..."},
+      "conscientiousness": {"score": -0.2, "confidence": 0.6, "evidence": "..."},
+      "extraversion": {"score": 0.8, "confidence": 0.8, "evidence": "..."},
+      "agreeableness": {"score": 0.3, "confidence": 0.5, "evidence": "..."},
+      "neuroticism": {"score": -0.1, "confidence": 0.7, "evidence": "..."}
+    },
+    "cognitive_patterns": [
+      {"name": "...", "severity": "moderate", "frequency": 5, "description": "..."}
+    ],
+    "communication_style": {
+      "formality": "casual",
+      "emotional_expressiveness": "high",
+      "argumentation": "analytical",
+      "humor": "sarcastic",
+      "defensiveness": "low"
+    }
+  },
+  "interests_and_skills": [
+    {"name": "Python", "category": "skill", "proficiency": "expert", "confidence": 0.9}
+  ],
+  "social_connections": [
+    {"person": "...", "relationship": "friend", "closeness": 0.8, "emotional_tone": "warm"}
+  ],
+  "timeline": [
+    {"date": "2023-05", "event": "...", "category": "career"}
+  ],
+  "uncertainties": [
+    {"item": "точный возраст", "reason": "противоречивые упоминания: 25 vs 26", "confidence": 0.4}
+  ],
+  "data_quality": {
+    "total_facts": 45,
+    "high_confidence_facts": 30,
+    "contradictions_found": 2,
+    "coverage_estimate": "good"
+  }
+}
+
+Верни ТОЛЬКО валидный JSON. Будь подробным, но лаконичным. Язык — как в исходном чате."""
+
+    SOCIAL_GRAPH_CONSOLIDATION_PROMPT = \
+    """Ты — аналитик социальных сетей.
+Проанализируй фрагментированные данные о связях между людьми и построй цельный социальный граф.
+
+=== ЗАДАЧИ ===
+
+1. ОБЪЕДИНИ дублирующиеся рёбра (одна пара, множество упоминаний)
+2. РАЗРЕШИ конфликтующие типы отношений (друг vs коллега → выбери доминирующий или гибрид)
+3. ВЫЯВИ скрытые связи из косвенных доказательств
+4. ОБНАРУЖИ кластеры и сообщества
+5. ОПРЕДЕЛИ ключевых личностей и изолированных
+6. ПРОАНАЛИЗИРУЙ эволюцию отношений во времени
+
+=== ФОРМАТ ===
+
+{
+  "consolidated_edges": [
+    {
+      "person_a": "...",
+      "person_b": "...",
+      "relationship_type": "close_friend",
+      "emotional_tone": "warm",
+      "power_dynamic": "equal",
+      "frequency": "daily",
+      "confidence": 0.9,
+      "evidence_summary": "..."
+    }
+  ],
+  "communities": [
+    {"members": ["...", "..."], "type": "family", "cohesion": 0.8}
+  ],
+  "key_nodes": {
+    "highest_degree": "...",
+    "most_influential": "...",
+    "most_isolated": "..."
+  },
+  "relationship_evolution": [
+    {"period": "2023-Q1", "event": "...", "affected_pair": ["...", "..."]}
+  ]
+}
+
+Верни ТОЛЬКО валидный JSON."""

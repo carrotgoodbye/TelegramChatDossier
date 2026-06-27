@@ -17,7 +17,8 @@ class LLMProcessor:
         "llama3.1": 131072, "llama3.2": 131072, "mistral": 32768,
         "mistral-nemo": 131072, "qwen2.5": 131072, "qwen2": 32768,
         "gemma2": 8192, "phi3": 131072, "command-r": 131072,
-        "deepseek-coder-v2": 131072, "mixtral": 32768, "default": 8192,
+        "deepseek-coder-v2": 131072, "mixtral": 32768, "qwen3": 40960,
+        "default": 8192,
     }
 
     def __init__(self, ollama_url: str, model: str):
@@ -140,12 +141,20 @@ class LLMProcessor:
 
         # Если парсинг вернул пустой fallback — логируем сырой ответ для отладки
         if not result.get('entities') and not result.get('facts'):
-            debug_path = Path("../llm_debug_responses")
+            debug_path = Path("llm_debug_responses")
             debug_path.mkdir(exist_ok=True)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             (debug_path / f"chunk_{ts}_raw.txt").write_text(raw_response, encoding='utf-8')
 
         return result
+
+    def process_with_prompt(self, system_prompt: str, user_prompt: str, temperature: float = 0.1) -> Dict[str, Any]:
+        """Универсальный метод для пост-обработки с кастомным промптом."""
+        raw_response = self._call([
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ], temperature=temperature)
+        return self._parse_json_response(raw_response)
 
     def _parse_json_response(self, text: str) -> Dict[str, Any]:
         text = text.strip()
