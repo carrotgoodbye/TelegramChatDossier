@@ -32,6 +32,8 @@ class StreamingGraphBuilder:
         self.all_authors = all_authors
         self.db_path = self.output_dir / "personality_graph.db"
 
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
         self._init_db()
 
         self._entity_keys: Set[str] = set()

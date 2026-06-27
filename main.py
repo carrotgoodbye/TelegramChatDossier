@@ -7,7 +7,7 @@ Telegram Multi-Personality Graph Builder (Obsidian Vault Generator)
 
 Usage:
     ollama serve
-    python main.py --input chat_export.json --output ./vault --model qwen3:1.7b --post-model qwen3:14b
+    python main.py --input chat_export.json --output ./vault --model qwen3:1.7b --post-model qwen3:14b --chunk-size 10000
 
 Requirements:
     pip install requests tqdm
