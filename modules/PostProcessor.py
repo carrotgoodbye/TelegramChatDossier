@@ -35,8 +35,10 @@ class PostProcessor:
 
         self.llm = LLMProcessor(ollama_url=ollama_url, model=model)
 
+        # Map: alias -> canonical name
         self.name_mapping: Dict[str, str] = {}
 
+        # Statistics
         self.stats = {
             'people_found': 0,
             'aliases_merged': 0,
@@ -57,22 +59,36 @@ class PostProcessor:
             logger.error(f"Raw database not found: {self.raw_db_path}")
             return
 
+        # Copy raw DB as base for clean DB
         shutil.copy(self.raw_db_path, self.clean_db_path)
         self.conn = sqlite3.connect(self.clean_db_path)
         self.conn.row_factory = sqlite3.Row
 
+        # Step 1: Discover all person names
         all_names = self._discover_all_names()
         self.stats['people_found'] = len(all_names)
         logger.info(f"Discovered {len(all_names)} unique names/aliases")
 
+        # Step 2: Deduplicate names via LLM
         if len(all_names) > 1:
             self._deduplicate_names(all_names)
 
+        # Step 3: Apply name mapping to all tables
         self._apply_name_mapping()
+
+        # Step 4: Consolidate facts per person (deduplicate within person)
         self._consolidate_facts()
+
+        # Step 5: Aggregate Big Five dimensions
         self._aggregate_dimensions()
+
+        # Step 6: Deduplicate entities
         self._deduplicate_entities()
+
+        # Step 7: Clean relations
         self._clean_relations()
+
+        # Step 8: Build enhanced vault from clean DB
         self._generate_enhanced_vault()
 
         self.conn.commit()
@@ -81,38 +97,50 @@ class PostProcessor:
         self._print_stats()
         logger.info(f"Clean database saved: {self.clean_db_path}")
 
+    # ── Step 1: Discover Names ──
+
     def _discover_all_names(self) -> List[str]:
+        """Собирает все уникальные имена из всех таблиц."""
         names = set()
         cursor = self.conn.cursor()
 
+        # From entities (belongs_to)
         cursor.execute("SELECT DISTINCT belongs_to FROM entities WHERE belongs_to != 'all'")
         names.update(r['belongs_to'] for r in cursor.fetchall())
 
+        # From facts
         cursor.execute("SELECT DISTINCT belongs_to FROM facts WHERE belongs_to != 'all'")
         names.update(r['belongs_to'] for r in cursor.fetchall())
 
+        # From patterns
         cursor.execute("SELECT DISTINCT belongs_to FROM cognitive_patterns WHERE belongs_to != 'all'")
         names.update(r['belongs_to'] for r in cursor.fetchall())
 
+        # From dimensions
         cursor.execute("SELECT DISTINCT belongs_to FROM personality_dimensions WHERE belongs_to != 'all'")
         names.update(r['belongs_to'] for r in cursor.fetchall())
 
+        # From communication styles
         cursor.execute("SELECT DISTINCT belongs_to FROM communication_styles WHERE belongs_to != 'all'")
         names.update(r['belongs_to'] for r in cursor.fetchall())
 
+        # From messages (authors)
         cursor.execute("SELECT DISTINCT author FROM messages")
         names.update(r['author'] for r in cursor.fetchall())
 
+        # From social graph
         cursor.execute("SELECT DISTINCT person_a FROM social_graph")
         names.update(r['person_a'] for r in cursor.fetchall())
         cursor.execute("SELECT DISTINCT person_b FROM social_graph")
         names.update(r['person_b'] for r in cursor.fetchall())
 
+        # From relations (source/target that look like people)
         cursor.execute("SELECT DISTINCT source FROM relations")
         names.update(r['source'] for r in cursor.fetchall())
         cursor.execute("SELECT DISTINCT target FROM relations")
         names.update(r['target'] for r in cursor.fetchall())
 
+        # Filter out non-person entities (heuristic: single words that are common objects/places)
         filtered = []
         for name in names:
             name = name.strip()
@@ -122,20 +150,21 @@ class PostProcessor:
 
         return sorted(set(filtered))
 
+    # ── Step 2: Deduplicate Names via LLM ──
+
     def _deduplicate_names(self, all_names: List[str]):
+        """Отправляет список имён в LLM для дедупликации с контекстными подсказками."""
         logger.info("Sending names to LLM for deduplication...")
 
-        batch_size = 100
+        # Собираем контекст для каждого имени (сущности, факты, связи)
+        name_context = self._build_name_context(all_names)
+
+        batch_size = 50  # Меньше батч для лучшего контекста
         all_groups = []
 
         for i in range(0, len(all_names), batch_size):
             batch = all_names[i:i + batch_size]
-            user_prompt = f"""Analyze these names extracted from chat messages and identify duplicates (same person, different names/aliases).
-
-Names with occurrence counts:
-{self._get_name_counts(batch)}
-
-Return JSON with canonical groups."""
+            user_prompt = self._build_dedup_prompt(batch, name_context)
 
             result = self.llm.process_with_prompt(
                 PostProcessingPrompts.DEDUPLICATION_PROMPT,
@@ -158,21 +187,80 @@ Return JSON with canonical groups."""
 
         logger.info(f"Created {len(all_groups)} canonical groups, merged {self.stats['aliases_merged']} aliases")
 
-    def _get_name_counts(self, names: List[str]) -> str:
+    def _build_name_context(self, names: List[str]) -> Dict[str, Dict]:
+        """Собирает контекст для каждого имени: сущности, факты, связанные люди."""
         cursor = self.conn.cursor()
+        context = {}
+
+        for name in names:
+            ctx = {
+                'entities': [],
+                'facts': [],
+                'relations': [],
+                'messages_count': 0,
+                'authors_mentioned_with': set(),
+            }
+
+            # Сущности
+            cursor.execute("SELECT name, category FROM entities WHERE belongs_to = ? LIMIT 10", (name,))
+            ctx['entities'] = [f"{r['name']}({r['category']})" for r in cursor.fetchall()]
+
+            # Факты
+            cursor.execute("SELECT fact, category FROM facts WHERE belongs_to = ? LIMIT 5", (name,))
+            ctx['facts'] = [f"{r['fact'][:50]}..." for r in cursor.fetchall()]
+
+            # Связи
+            cursor.execute("""
+                SELECT target, relation_type FROM relations 
+                WHERE source = ? OR belongs_to = ? LIMIT 10
+            """, (name, name))
+            ctx['relations'] = [f"{r['target']}({r['relation_type']})" for r in cursor.fetchall()]
+
+            # Сообщения
+            cursor.execute("SELECT COUNT(*) as cnt FROM messages WHERE author = ?", (name,))
+            ctx['messages_count'] = cursor.fetchone()['cnt']
+
+            # С кем упоминается в одних чанках
+            cursor.execute("""
+                SELECT DISTINCT author FROM messages 
+                WHERE text LIKE ? AND author != ?
+                LIMIT 5
+            """, (f"%{name}%", name))
+            ctx['authors_mentioned_with'] = [r['author'] for r in cursor.fetchall()]
+
+            context[name] = ctx
+
+        return context
+
+    def _build_dedup_prompt(self, names: List[str], context: Dict) -> str:
+        """Строит промпт с контекстными подсказками для каждого имени."""
         lines = []
         for name in names:
-            cursor.execute("SELECT COUNT(*) as cnt FROM entities WHERE belongs_to = ?", (name,))
-            ent_count = cursor.fetchone()['cnt']
-            cursor.execute("SELECT COUNT(*) as cnt FROM facts WHERE belongs_to = ?", (name,))
-            fact_count = cursor.fetchone()['cnt']
-            cursor.execute("SELECT COUNT(*) as cnt FROM messages WHERE author = ?", (name,))
-            msg_count = cursor.fetchone()['cnt']
-            total = ent_count + fact_count + msg_count
-            lines.append(f"  {name}: {total} references")
-        return '\n'.join(lines)
+            ctx = context.get(name, {})
+            lines.append(f"\n=== {name} ===")
+            lines.append(f"  Сообщений как автор: {ctx.get('messages_count', 0)}")
+            if ctx.get('entities'):
+                lines.append(f"  Сущности: {', '.join(ctx['entities'][:5])}")
+            if ctx.get('facts'):
+                lines.append(f"  Факты: {', '.join(ctx['facts'][:3])}")
+            if ctx.get('relations'):
+                lines.append(f"  Связи: {', '.join(ctx['relations'][:5])}")
+            if ctx.get('authors_mentioned_with'):
+                lines.append(f"  Упоминается с: {', '.join(ctx['authors_mentioned_with'])}")
+
+        return f"""Проанализируй следующие имена и их контекст из переписки.
+Определи, какие имена относятся к ОДНОМУ реальному человеку.
+
+КОНТЕКСТ ДЛЯ КАЖДОГО ИМЕНИ:
+{chr(10).join(lines)}
+
+Верни JSON с canonical_groups и uncertain_matches.
+"""
+
+    # ── Step 3: Apply Name Mapping ──
 
     def _apply_name_mapping(self):
+        """Применяет маппинг имён ко всем таблицам."""
         if not self.name_mapping:
             return
 
@@ -204,7 +292,10 @@ Return JSON with canonical groups."""
         self.conn.commit()
         logger.info("Name mapping applied")
 
+    # ── Step 4: Consolidate Facts ──
+
     def _consolidate_facts(self):
+        """Дедуплицирует факты внутри каждого человека, мержит похожие."""
         logger.info("Consolidating facts...")
         cursor = self.conn.cursor()
 
@@ -223,6 +314,7 @@ Return JSON with canonical groups."""
             if len(facts) <= 1:
                 continue
 
+            # Простая дедупликация: удаляем факты, которые являются подстроками более длинных
             to_delete = set()
             for i, f1 in enumerate(facts):
                 if f1['id'] in to_delete:
@@ -230,6 +322,7 @@ Return JSON with canonical groups."""
                 for j, f2 in enumerate(facts):
                     if i >= j or f2['id'] in to_delete:
                         continue
+                    # Если f2 — подстрока f1 и та же категория
                     if f2['fact'].lower() in f1['fact'].lower() and f1['category'] == f2['category']:
                         to_delete.add(f2['id'])
                         self.stats['facts_removed_as_duplicates'] += 1
@@ -243,7 +336,10 @@ Return JSON with canonical groups."""
         self.conn.commit()
         logger.info(f"Removed {self.stats['facts_removed_as_duplicates']} duplicate facts")
 
+    # ── Step 5: Aggregate Dimensions ──
+
     def _aggregate_dimensions(self):
+        """Усредняет Big Five измерения по каждому человеку."""
         logger.info("Aggregating personality dimensions...")
         cursor = self.conn.cursor()
 
@@ -257,6 +353,7 @@ Return JSON with canonical groups."""
             GROUP BY belongs_to, dimension
         """)
 
+        # Создаём таблицу для агрегированных измерений
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS personality_dimensions_agg (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -285,7 +382,10 @@ Return JSON with canonical groups."""
 
         self.conn.commit()
 
+    # ── Step 6: Deduplicate Entities ──
+
     def _deduplicate_entities(self):
+        """Удаляет дублирующиеся сущности внутри человека."""
         logger.info("Deduplicating entities...")
         cursor = self.conn.cursor()
 
@@ -311,12 +411,17 @@ Return JSON with canonical groups."""
 
         self.conn.commit()
 
+    # ── Step 7: Clean Relations ──
+
     def _clean_relations(self):
+        """Удаляет self-relations и дубли."""
         logger.info("Cleaning relations...")
         cursor = self.conn.cursor()
 
+        # Remove self-relations
         cursor.execute("DELETE FROM relations WHERE LOWER(source) = LOWER(target)")
 
+        # Remove duplicate relations keeping strongest
         cursor.execute("""
             DELETE FROM relations 
             WHERE id NOT IN (
@@ -327,7 +432,10 @@ Return JSON with canonical groups."""
 
         self.conn.commit()
 
+    # ── Step 8: Generate Enhanced Vault ──
+
     def _generate_enhanced_vault(self):
+        """Генерирует улучшенный vault из clean DB."""
         logger.info("Generating enhanced Obsidian vault...")
 
         if self.vault_dir.exists():
@@ -338,6 +446,7 @@ Return JSON with canonical groups."""
 
         cursor = self.conn.cursor()
 
+        # Get all people (only real people, filtered)
         cursor.execute("SELECT DISTINCT belongs_to FROM entities WHERE belongs_to != 'all'")
         people = set(r['belongs_to'] for r in cursor.fetchall())
         cursor.execute("SELECT DISTINCT author FROM messages")
@@ -360,7 +469,7 @@ Return JSON with canonical groups."""
         logger.info(f"Enhanced vault generated: {self.vault_dir}")
 
     def _safe_filename(self, name: str) -> str:
-        safe = re.sub(r'[<>:\"/\\|?*]', '_', name)
+        safe = re.sub(r'[<>:"/\\|?*]', '_', name)
         safe = safe.strip('. ')
         return safe[:100] or 'untitled'
 
@@ -393,10 +502,12 @@ date: {datetime.now().isoformat()}
         (self.vault_dir / "🏠 Home.md").write_text(content, encoding='utf-8')
 
     def _generate_clean_person_profile(self, cursor, person: str):
+        """Генерирует очищенный профиль с агрегированными данными."""
         safe = self._safe_filename(person)
         person_dir = self.vault_dir / "People" / safe
         person_dir.mkdir(parents=True, exist_ok=True)
 
+        # Aggregated Big Five
         cursor.execute("""
             SELECT dimension, score, confidence, sample_count, evidence
             FROM personality_dimensions_agg
@@ -405,6 +516,7 @@ date: {datetime.now().isoformat()}
         """, (person,))
         big_five = cursor.fetchall()
 
+        # Consolidated facts by category
         cursor.execute("""
             SELECT fact, category, confidence, first_seen
             FROM facts
@@ -413,6 +525,7 @@ date: {datetime.now().isoformat()}
         """, (person,))
         facts = cursor.fetchall()
 
+        # Patterns
         cursor.execute("""
             SELECT pattern_name, description, frequency, severity
             FROM cognitive_patterns
@@ -421,6 +534,7 @@ date: {datetime.now().isoformat()}
         """, (person,))
         patterns = cursor.fetchall()
 
+        # Entities
         cursor.execute("""
             SELECT name, category, occurrence_count, confidence, sentiment
             FROM entities
@@ -430,6 +544,7 @@ date: {datetime.now().isoformat()}
         """, (person,))
         entities = cursor.fetchall()
 
+        # Relations
         cursor.execute("""
             SELECT source, target, relation_type, strength
             FROM relations
@@ -439,11 +554,14 @@ date: {datetime.now().isoformat()}
         """, (person, person, person))
         relations = cursor.fetchall()
 
+        # Communication style
         cursor.execute("SELECT * FROM communication_styles WHERE belongs_to = ?", (person,))
         comm = cursor.fetchone()
 
+        # Aliases
         aliases = [a for a, c in self.name_mapping.items() if c == person]
 
+        # ── Profile Page ──
         profile = f"""---
 tags: [profile, clean, {safe}]
 person: {person}
@@ -452,23 +570,23 @@ aliases: {json.dumps(aliases)}
 
 # 🧠 {person}
 
-> **Canonical Name:** {person}
-> **Also Known As:** {', '.join(aliases) if aliases else '—'}
+> **Каноническое имя:** {person}
+> **Также известен как:** {', '.join(aliases) if aliases else '—'}
 
-## 📊 Personality Profile
+## 📊 Профиль личности
 
-### Big Five (Aggregated)
+### Big Five (агрегировано)
 
-| Dimension | Score | Confidence | Samples |
-|-----------|-------|------------|---------|
+| Измерение | Скор | Уверенность | Выборок |
+|-----------|------|-------------|---------|
 """
         for dim in big_five:
             profile += f"| {dim['dimension'].title()} | {dim['score']:+.2f} | {dim['confidence']:.2f} | {dim['sample_count']} |\n"
 
         if not big_five:
-            profile += "| *No data* | — | — | — |\n"
+            profile += "| *Нет данных* | — | — | — |\n"
 
-        profile += "\n## 📝 Biography\n\n"
+        profile += "\n## 📝 Биография\n\n"
 
         by_cat = defaultdict(list)
         for f in facts:
@@ -477,19 +595,19 @@ aliases: {json.dumps(aliases)}
         for cat, items in sorted(by_cat.items()):
             profile += f"\n### {cat.title()} ({len(items)})\n\n"
             for item in items[:20]:
-                profile += f"- {item['fact']} *(conf: {item['confidence']:.2f})*\n"
+                profile += f"- {item['fact']} *(уверенность: {item['confidence']:.2f})*\n"
             if len(items) > 20:
-                profile += f"- *...and {len(items) - 20} more*\n"
+                profile += f"- *...и ещё {len(items) - 20}*\n"
 
-        profile += "\n## 🧩 Cognitive Patterns\n\n"
+        profile += "\n## 🧩 Когнитивные паттерны\n\n"
         for pat in patterns[:10]:
             profile += f"- **{pat['pattern_name']}** ({pat['severity']}, {pat['frequency']}×)\n"
 
-        profile += "\n## 🎯 Key Entities\n\n"
+        profile += "\n## 🎯 Ключевые сущности\n\n"
         for ent in entities[:20]:
             profile += f"- {ent['name']} ({ent['category']}, {ent['occurrence_count']}×, {ent['sentiment']})\n"
 
-        profile += "\n## 🔗 Key Relations\n\n"
+        profile += "\n## 🔗 Ключевые связи\n\n"
         profile += "```mermaid\ngraph LR\n"
         for rel in relations[:10]:
             src = self._safe_filename(rel['source'])
@@ -498,29 +616,32 @@ aliases: {json.dumps(aliases)}
         profile += "```\n"
 
         if comm:
-            profile += f"""\n## 💬 Communication Style
+            profile += f"""\n## 💬 Стиль общения
 
-- **Formality:** {comm['formality'] or 'unknown'}
-- **Emotional Expressiveness:** {comm['emotional_expressiveness'] or 'unknown'}
-- **Argumentation:** {comm['argumentation'] or 'unknown'}
-- **Humor:** {comm['humor'] or 'unknown'}
-- **Defensiveness:** {comm['defensiveness'] or 'unknown'}
+- **Формальность:** {comm['formality'] or 'неизвестно'}
+- **Эмоциональная экспрессивность:** {comm['emotional_expressiveness'] or 'неизвестно'}
+- **Аргументация:** {comm['argumentation'] or 'неизвестно'}
+- **Юмор:** {comm['humor'] or 'неизвестно'}
+- **Оборонительность:** {comm['defensiveness'] or 'неизвестно'}
 """
 
         (person_dir / "🧠 Profile.md").write_text(profile, encoding='utf-8')
 
-        bio = f"# 📜 Full Biography: {person}\n\n"
+        # ── Detailed Pages ──
+        # Biography page
+        bio = f"# 📜 Полная биография: {person}\n\n"
         for cat, items in sorted(by_cat.items()):
             bio += f"\n## {cat.title()}\n\n"
             for item in items:
-                bio += f"- {item['fact']} *(conf: {item['confidence']:.2f}, {item['first_seen'][:10]})*\n"
+                bio += f"- {item['fact']} *(уверенность: {item['confidence']:.2f}, {item['first_seen'][:10]})*\n"
         (person_dir / "📜 Biography.md").write_text(bio, encoding='utf-8')
 
-        pat_page = f"# 🧩 Cognitive Patterns: {person}\n\n"
+        # Patterns page
+        pat_page = f"# 🧩 Когнитивные паттерны: {person}\n\n"
         for pat in patterns:
             pat_page += f"""\n## {pat['pattern_name'].title()}
 
-**Severity:** {pat['severity']} | **Frequency:** {pat['frequency']}
+**Тяжесть:** {pat['severity']} | **Частота:** {pat['frequency']}
 
 {pat['description'][:400]}
 
@@ -528,25 +649,28 @@ aliases: {json.dumps(aliases)}
 """
         (person_dir / "🧩 Patterns.md").write_text(pat_page, encoding='utf-8')
 
-        rel_page = f"# 🔗 All Relations: {person}\n\n"
-        rel_page += "| Source | Type | Target | Strength |\n"
-        rel_page += "|--------|------|--------|----------|\n"
+        # Relations page
+        rel_page = f"# 🔗 Все связи: {person}\n\n"
+        rel_page += "| Источник | Тип | Цель | Сила |\n"
+        rel_page += "|----------|-----|------|------|\n"
         for rel in relations:
             rel_page += f"| {rel['source']} | {rel['relation_type']} | {rel['target']} | {rel['strength']:.2f} |\n"
         (person_dir / "🔗 Relations.md").write_text(rel_page, encoding='utf-8')
 
     def _generate_network_analysis(self, cursor):
+        """Генерирует анализ социальной сети."""
         cursor.execute("SELECT * FROM social_graph ORDER BY person_a, person_b")
         edges = cursor.fetchall()
 
-        content = "# 🕸️ Social Network Analysis\n\n"
+        content = "# 🕸️ Анализ социальной сети\n\n"
         content += "```mermaid\ngraph TD\n"
         for edge in edges:
             a = self._safe_filename(edge['person_a'])
             b = self._safe_filename(edge['person_b'])
-            content += f"    {a}[\"{edge['person_a']}\"] -->|{edge['relationship_type'] or 'connected'}| {b}[\"{edge['person_b']}\"]\n"
+            content += f"    {a}[\"{edge['person_a']}\"] -->|{edge['relationship_type'] or 'связь'}| {b}[\"{edge['person_b']}\"]\n"
         content += "```\n\n"
 
+        # Degree centrality
         cursor.execute("""
             SELECT person, COUNT(*) as degree FROM (
                 SELECT person_a as person FROM social_graph
@@ -554,9 +678,9 @@ aliases: {json.dumps(aliases)}
                 SELECT person_b as person FROM social_graph
             ) GROUP BY person ORDER BY degree DESC
         """)
-        content += "## Degree Centrality\n\n"
-        content += "| Person | Connections |\n"
-        content += "|--------|-------------|\n"
+        content += "## Центральность по степени\n\n"
+        content += "| Человек | Связей |\n"
+        content += "|---------|--------|\n"
         for row in cursor.fetchall():
             content += f"| {row['person']} | {row['degree']} |\n"
 
@@ -571,9 +695,9 @@ aliases: {json.dumps(aliases)}
             ORDER BY total_freq DESC
         """)
         patterns = cursor.fetchall()
-        content = "# 🧩 Global Cognitive Patterns\n\n"
-        content += "| Pattern | Affected People | Total Frequency |\n"
-        content += "|---------|-----------------|-----------------|\n"
+        content = "# 🧩 Глобальные когнитивные паттерны\n\n"
+        content += "| Паттерн | Затронуто людей | Общая частота |\n"
+        content += "|---------|-----------------|---------------|\n"
         for p in patterns:
             content += f"| {p['pattern_name']} | {p['people']} | {p['total_freq']} |\n"
         (self.vault_dir / "Analysis" / "🧩 Patterns.md").mkdir(parents=True, exist_ok=True)
@@ -596,8 +720,8 @@ aliases: {json.dumps(aliases)}
                 pass
         events.sort(key=lambda x: x['date'])
 
-        content = "# 📅 Consolidated Timeline\n\n"
-        content += "```mermaid\ntimeline\n    title Life Events\n"
+        content = "# 📅 Консолидированная хронология\n\n"
+        content += "```mermaid\ntimeline\n    title События жизни\n"
         for ev in events[:80]:
             safe = self._safe_filename(ev['event'])
             content += f"    {ev['date']} : {ev['person']} — [[{safe}|{ev['event']}]]\n"
